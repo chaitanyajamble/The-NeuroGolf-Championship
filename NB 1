@@ -1,0 +1,130 @@
+
+import os
+import json
+import numpy as np
+import matplotlib.pyplot as plt
+import torch
+import torch.nn as nn
+import onnx
+import zipfile
+import shutil
+from pathlib import Path
+
+# --- 1. CONFIGURATION ---
+# Using the path you provided
+DATA_PATH = Path('/---/input/competitions/neurogolf-2026')
+SUBMISSION_DIR = Path('/---/working/submission')
+
+# Ensure clean directory for submission files
+if SUBMISSION_DIR.exists():
+    shutil.rmtree(SUBMISSION_DIR)
+SUBMISSION_DIR.mkdir(parents=True, exist_ok=True)
+
+# --- 2. EDA & VISUALIZATION ---
+def load_task(task_id):
+    file_path = DATA_PATH / f'task{task_id:03d}.json'
+    if not file_path.exists():
+        return None
+    with open(file_path, 'r') as f:
+        return json.load(f)
+
+def plot_sample_task(task_id=6):
+    task_data = load_task(task_id)
+    if task_data:
+        print(f"Visualizing Task {task_id}:")
+        fig, axs = plt.subplots(1, 2, figsize=(10, 5))
+        input_grid = np.array(task_data['train'][0]['input'])
+        output_grid = np.array(task_data['train'][0]['output'])
+        
+        axs[0].imshow(input_grid, cmap='tab10', vmin=0, vmax=9)
+        axs[0].set_title("Example Input")
+        axs[1].imshow(output_grid, cmap='tab10', vmin=0, vmax=9)
+        axs[1].set_title("Expected Output")
+        plt.show()
+    else:
+        print(f"Task {task_id} not found in {DATA_PATH}")
+
+# Run visualization
+plot_sample_task(6)
+
+# --- 3. BASELINE MODEL ---
+class NeuroGolfBaseline(nn.Module):
+    """
+    Minimal model: A 1x1 convolution that acts as an identity filter.
+    Input: [1, 10, 30, 30] -> Output: [1, 10, 30, 30]
+    """
+    def __init__(self):
+        super(NeuroGolfBaseline, self).__init__()
+        self.conv = nn.Conv2d(10, 10, kernel_size=1, bias=False)
+        # Initialize as Identity matrix so input colors = output colors
+        with torch.no_grad():
+            identity_weight = torch.eye(10).view(10, 10, 1, 1)
+            self.conv.weight.copy_(identity_weight)
+
+    def forward(self, x):
+        return self.conv(x)
+
+# --- 4. GENERATING MODELS & FIXING IMPORT ERROR ---
+def generate_onnx_files():
+    model = NeuroGolfBaseline()
+    model.eval()
+    
+    # Standard dummy input for the competition
+    dummy_input = torch.randn(1, 10, 30, 30)
+    
+    print("Exporting 400 models to ONNX...")
+    for i in range(1, 401):
+        task_filename = f"task{i:03d}.onnx"
+        save_path = str(SUBMISSION_DIR / task_filename)
+        
+        try:
+            # We explicitly use opset_version=11 or 12 to avoid 
+            # triggering the newer onnxscript-dependent 'Dynamo' exporter.
+            torch.onnx.export(
+                model, 
+                dummy_input, 
+                save_path,
+                export_params=True,
+                opset_version=11, 
+                do_constant_folding=True,
+                input_names=['input'],
+                output_names=['output'],
+                # This flag helps prevent the error shown in your screenshot
+                operator_export_type=torch.onnx.OperatorExportTypes.ONNX
+            )
+        except Exception as e:
+            # Fallback for older torch versions if needed
+            if "onnxscript" in str(e).lower():
+                print(f"Warning: Skipping {task_filename} due to backend issue.")
+            else:
+                raise e
+                
+        if i % 100 == 0:
+            print(f"Generated {i}/400...")
+
+# --- 5. CREATE SUBMISSION ZIP ---
+def create_submission_zip():
+    zip_path = '/---/working/submission.zip'
+    with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_DEFLATED) as z:
+        files_added = 0
+        for i in range(1, 401):
+            file_name = f"task{i:03d}.onnx"
+            file_path = SUBMISSION_DIR / file_name
+            if file_path.exists():
+                z.write(file_path, arcname=file_name)
+                files_added += 1
+    
+    print(f"Archive created: {zip_path} with {files_added} files.")
+
+# --- MAIN EXECUTION ---
+if __name__ == "__main__":
+    # Step 1: Create models
+    generate_onnx_files()
+    
+    # Step 2: Zip them up
+    create_submission_zip()
+    
+    # Step 3: Cleanup to avoid "Out of Memory/Disk" errors
+    if SUBMISSION_DIR.exists():
+        shutil.rmtree(SUBMISSION_DIR)
+        print("Cleaned up temporary model files.")
